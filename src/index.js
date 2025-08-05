@@ -59,7 +59,7 @@ class BitToHubMigrator {
       process.env.GITHUB_ORG
     );
 
-    this.git = new GitManager(this.tempDir);
+    this.git = new GitManager(this.tempDir, this.logger);
   }
 
   async migrateAll() {
