@@ -335,13 +335,14 @@ export class GitManager {
     const filePaths = largeFiles.map(file => file.path);
     
     return new Promise((resolve, reject) => {
-      // git filter-repo를 사용하여 대용량 파일들을 제거
-      const filterRepo = spawn('git', [
+      const args = [
         'filter-repo',
-        '--path-glob',
-        `!(${filePaths.join('|')})`,
+        '--invert-paths',
         '--force'
-      ], {
+      ];
+      filePaths.forEach(p => args.push('--path', p));
+
+      const filterRepo = spawn('git', args, {
         cwd: repoPath,
         stdio: ['pipe', 'pipe', 'pipe']
       });
@@ -353,10 +354,10 @@ export class GitManager {
 
       filterRepo.on('close', (code) => {
         if (code === 0) {
-          this.log('Successfully removed large files from repository history');
+          this.log('Successfully removed large files using git-filter-repo.');
           resolve(true);
         } else {
-          // git filter-repo가 없으면 git filter-branch 사용
+          this.logWarning('git-filter-repo failed, falling back to git-filter-branch.');
           this.removeLargeFilesWithFilterBranch(repoPath, filePaths)
             .then(resolve)
             .catch(reject);
@@ -364,7 +365,7 @@ export class GitManager {
       });
 
       filterRepo.on('error', (error) => {
-        // git filter-repo가 설치되지 않은 경우 filter-branch로 fallback
+        this.logWarning('git-filter-repo not found, falling back to git-filter-branch.');
         this.removeLargeFilesWithFilterBranch(repoPath, filePaths)
           .then(resolve)
           .catch(reject);
@@ -376,66 +377,42 @@ export class GitManager {
     const git = simpleGit(repoPath);
     
     try {
-      this.log('Starting comprehensive large file removal...');
+      this.log('Starting large file removal with git-filter-branch...');
       
-      for (const filePath of filePaths) {
-        this.log(`Removing ${filePath} from repository history...`);
-        
+      const rmCommand = filePaths.map(p => `git rm --cached --ignore-unmatch \"${p}\"`).join(' && ');
+
+      await git.raw([
+        'filter-branch',
+        '--force',
+        '--index-filter',
+        rmCommand,
+        '--prune-empty',
+        '--tag-name-filter',
+        'cat',
+        '--',
+        '--all'
+      ]);
+
+      this.log('Finished filter-branch. Now cleaning up refs/original/.');
+
+      // refs/original/ 네임스페이스를 완전히 제거합니다.
+      // 이를 통해 미러 푸시 시 오래된 참조로 인한 문제를 방지합니다.
+      const forEachRef = await git.raw(['for-each-ref', '--format=%(refname)', 'refs/original/']);
+      const originalRefs = forEachRef.split('\n').filter(ref => ref.trim() !== '');
+
+      for (const ref of originalRefs) {
         try {
-          // Step 1: git filter-branch로 파일 제거
-          await git.raw([
-            'filter-branch',
-            '--force',
-            '--index-filter',
-            `git rm --cached --ignore-unmatch "${filePath}"`,
-            '--prune-empty',
-            '--tag-name-filter',
-            'cat',
-            '--',
-            '--all'
-          ]);
-          
-          // Step 2: 모든 브랜치에서 파일 제거 확인
-          const branches = await git.branch(['-a']);
-          for (const branch of branches.all) {
-            if (branch.startsWith('remotes/') || branch === 'HEAD') continue;
-            
-            try {
-              await git.checkout(branch);
-              await git.raw(['rm', '--cached', '--ignore-unmatch', filePath]);
-            } catch (e) {
-              // 브랜치에 파일이 없을 수 있음
-            }
-          }
-          
-          this.log(`Successfully removed ${filePath}`);
-        } catch (error) {
-          this.logWarning(`Failed to remove ${filePath}: ${error.message}`);
+          await git.raw(['update-ref', '-d', ref]);
+        } catch (e) {
+          this.logWarning(`Could not delete original ref: ${ref}`);
         }
       }
       
-      // Step 3: 강력한 정리 작업
-      try {
-        // 모든 참조 제거
-        await git.raw(['for-each-ref', '--format=delete %(refname)', 'refs/original/']);
-        
-        // reflog 완전 정리
-        await git.raw(['reflog', 'expire', '--expire=now', '--all']);
-        
-        // 가비지 컬렉션 (더 강력하게)
-        await git.raw(['gc', '--prune=now', '--aggressive']);
-        
-        // 압축되지 않은 객체 정리
-        await git.raw(['repack', '-ad']);
-        
-        this.log('Completed comprehensive repository cleanup');
-      } catch (cleanupError) {
-        this.logWarning(`Cleanup warning: ${cleanupError.message}`);
-      }
-      
+      this.log('Successfully removed large files and original refs.');
       return true;
+
     } catch (error) {
-      throw new Error(`Failed to remove large files: ${error.message}`);
+      throw new Error(`Failed to remove large files with filter-branch: ${error.message}`);
     }
   }
 
